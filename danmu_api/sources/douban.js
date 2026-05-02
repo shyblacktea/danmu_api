@@ -1,24 +1,40 @@
 import BaseSource from './base.js';
 import { log } from "../utils/log-util.js";
-import { getDoubanDetail, searchDoubanTitles } from "../utils/douban-util.js";
+import { getDoubanDetail, searchDoubanTitles, searchDoubanTitlesByPublic } from "../utils/douban-util.js";
 
 // =====================
 // 获取豆瓣源播放链接
 // =====================
 export default class DoubanSource extends BaseSource {
-  constructor(tencentSource, iqiyiSource, youkuSource, bilibiliSource) {
+  constructor(tencentSource, iqiyiSource, youkuSource, bilibiliSource, miguSource) {
     super('BaseSource');
     this.tencentSource = tencentSource;
     this.iqiyiSource = iqiyiSource;
     this.youkuSource = youkuSource;
     this.bilibiliSource = bilibiliSource;
+    this.miguSource = miguSource;
   }
 
   async search(keyword) {
     try {
-      const response = await searchDoubanTitles(keyword);
+      let response = await searchDoubanTitles(keyword);
+      let data = response?.data;
 
-      const data = response.data;
+      // 兜底策略：如果 searchDoubanTitles 失败或返回空结果，使用 searchDoubanTitlesByPublic
+      if (!data || (!data?.subjects?.items?.length && !data?.smart_box?.length)) {
+        log("info", "searchDoubanTitles failed or empty, trying searchDoubanTitlesByPublic");
+        const fallbackResponse = await searchDoubanTitlesByPublic(keyword);
+        const fallbackData = fallbackResponse?.data;
+
+        if (fallbackData?.subjects?.length > 0) {
+          // 将 searchDoubanTitlesByPublic 返回的数据转换为原格式
+          data = {
+            subjects: {
+              items: fallbackData.subjects.map(item => this.convertToOriginalFormat(item)),
+            }
+          };
+        }
+      }
 
       let tmpAnimes = [];
       if (data?.subjects?.items?.length > 0) {
@@ -42,9 +58,61 @@ export default class DoubanSource extends BaseSource {
     }
   }
 
+  // 将 searchDoubanTitlesByPublic 返回的数据格式转换为原格式
+  convertToOriginalFormat(item) {
+    // subtype: "movie" -> "电影", "tv" -> "电视剧"
+    const typeMap = {
+      'movie': '电影',
+      'tv': '电视剧'
+    };
+    const typeName = typeMap[item.subtype] || item.subtype;
+
+    // 构建 cover_url：从原始图片URL中提取图片ID，然后构造固定格式的URL
+    const originalImageUrl = item.images?.large || item.images?.medium || item.images?.small || '';
+    let coverUrl = '';
+    if (originalImageUrl) {
+      // 从类似 https://img3.doubanio.com/view/photo/s_ratio_poster/public/p2887095203.jpg 的URL中提取 p2887095203
+      const match = originalImageUrl.match(/\/(p\d+)\.jpg/);
+      if (match && match[1]) {
+        const imageId = match[1]; // 例如 p2887095203
+        coverUrl = `https://qnmob3.doubanio.com/view/photo/large/public/${imageId}.jpg?imageView2/0/q/80/w/9999/h/120/format/jpg`;
+      }
+    }
+
+    // 构建 card_subtitle，包含地区、类型、导演、演员等信息
+    const directors = item.directors?.map(d => d.name).join(' ') || '';
+    const casts = item.casts?.slice(0, 3).map(c => c.name).join(' ') || '';
+    const cardSubtitle = `${item.year} / ${item.genres?.join(' / ') || ''} / ${directors}${casts ? ' / ' + casts : ''}`;
+
+    return {
+      layout: 'subject',
+      type_name: typeName,
+      target_id: String(item.id),
+      target: {
+        rating: {
+          count: item.collect_count || 0,
+          max: item.rating?.max || 10,
+          star_count: item.rating?.stars ? parseInt(item.rating.stars) / 10 : 0,
+          value: item.rating?.average || 0
+        },
+        controversy_reason: '',
+        title: item.title,
+        abstract: '',
+        has_linewatch: false,
+        uri: `douban://douban.com/${item.subtype === 'movie' ? 'movie' : 'tv'}/${item.id}`,
+        cover_url: coverUrl,
+        year: String(item.year || ''),
+        card_subtitle: cardSubtitle,
+        id: String(item.id),
+        null_rating_reason: ''
+      },
+      target_type: item.subtype === 'movie' ? 'movie' : 'tv'
+    };
+  }
+
   async getEpisodes(id) {}
 
-  async handleAnimes(sourceAnimes, queryTitle, curAnimes, vodName) {
+  async handleAnimes(sourceAnimes, queryTitle, curAnimes, detailStore = null) {
     const doubanAnimes = [];
 
     // 添加错误处理，确保sourceAnimes是数组
@@ -112,7 +180,7 @@ export default class DoubanSource extends BaseSource {
               if (cid) {
                 tmpAnimes[0].provider = "tencent";
                 tmpAnimes[0].mediaId = cid;
-                await this.tencentSource.handleAnimes(tmpAnimes, response.data?.title, doubanAnimes)
+                await this.tencentSource.handleAnimes(tmpAnimes, response.data?.title, doubanAnimes, detailStore)
               }
               break;
             }
@@ -121,7 +189,7 @@ export default class DoubanSource extends BaseSource {
               if (tvid) {
                 tmpAnimes[0].provider = "iqiyi";
                 tmpAnimes[0].mediaId = anime?.type_name === '电影' ? `movie_${tvid}` : tvid;
-                await this.iqiyiSource.handleAnimes(tmpAnimes, response.data?.title, doubanAnimes)
+                await this.iqiyiSource.handleAnimes(tmpAnimes, response.data?.title, doubanAnimes, detailStore)
               }
               break;
             }
@@ -130,7 +198,7 @@ export default class DoubanSource extends BaseSource {
               if (showId) {
                 tmpAnimes[0].provider = "youku";
                 tmpAnimes[0].mediaId = showId;
-                await this.youkuSource.handleAnimes(tmpAnimes, response.data?.title, doubanAnimes)
+                await this.youkuSource.handleAnimes(tmpAnimes, response.data?.title, doubanAnimes, detailStore)
               }
               break;
             }
@@ -139,7 +207,21 @@ export default class DoubanSource extends BaseSource {
               if (seasonId) {
                 tmpAnimes[0].provider = "bilibili";
                 tmpAnimes[0].mediaId = `ss${seasonId}`;
-                await this.bilibiliSource.handleAnimes(tmpAnimes, response.data?.title, doubanAnimes)
+                await this.bilibiliSource.handleAnimes(tmpAnimes, response.data?.title, doubanAnimes, detailStore)
+              }
+              break;
+            }
+            case "miguvideo": {
+              let epId = null;
+              const decodeUrl = decodeURIComponent(vendor.uri);
+              const contentIdMatch = decodeUrl.match(/"contentID":"([^"]+)"/);
+              if (contentIdMatch && contentIdMatch[1]) {
+                epId = contentIdMatch[1];
+              }
+              if (epId) {
+                tmpAnimes[0].provider = "migu";
+                tmpAnimes[0].mediaId = `https://v3-sc.miguvideo.com/program/v4/cont/content-info/${epId}/1`;
+                await this.miguSource.handleAnimes(tmpAnimes, response.data?.title, doubanAnimes, detailStore)
               }
               break;
             }
